@@ -1,0 +1,4 @@
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY telemetry-ingest /telemetry-ingest
+EXPOSE 8080
+ENTRYPOINT ["/telemetry-ingest"]

@@ -1,0 +1,119 @@
+# Publish as .github/workflows/ci.yml in the designated standalone source repo.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {persist-credentials: false}
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.15
+          sha256: a6dea05e896f1e6090f821588f45397262270e0e0b456252f8d1da28a416f3f2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: source-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: source-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha != vars.REFERENCE_BASELINE_COMMIT
+    needs: test
+    # Build against glibc 2.35, compatible with the Debian 12 runtime (2.36).
+    # A newer runner ABI cannot safely be copied into that runtime image.
+    runs-on: ubuntu-22.04
+    environment: reference-release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {persist-credentials: false}
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.15
+          sha256: a6dea05e896f1e6090f821588f45397262270e0e0b456252f8d1da28a416f3f2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+      - name: Compile once using the retained release target
+        run: |
+          cargo build --locked --release
+          mkdir image
+          cp target/release/telemetry-ingest image/telemetry-ingest
+          cp Containerfile.runtime image/Containerfile
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select immutable image name
+        id: image
+        env: {REPOSITORY: "${{ github.repository }}"}
+        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        id: build
+        with:
+          context: image
+          file: image/Containerfile
+          push: true
+          tags: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=source-release
+          cache-to: type=gha,mode=max,scope=source-release
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+      - name: Authorize only the designated platform repository
+        id: platform
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ vars.PLATFORM_OWNER }}
+          repositories: ${{ vars.PLATFORM_REPOSITORY }}
+          permission-contents: write
+      - name: Publish the release through the deployment repository
+        env:
+          GH_TOKEN: ${{ steps.platform.outputs.token }}
+          PLATFORM_OWNER: ${{ vars.PLATFORM_OWNER }}
+          PLATFORM_REPOSITORY: ${{ vars.PLATFORM_REPOSITORY }}
+          IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "${PLATFORM_OWNER}/${PLATFORM_REPOSITORY}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]
+          repository="${PLATFORM_OWNER}/${PLATFORM_REPOSITORY}"
+          # An admin labels disposable repositories explicitly before setup.
+          gh api "repos/${repository}/topics" --jq '.names[]' | grep -qx jouren-disposable-lab
+          # A reset may have moved source main while this release was queued.
+          current=$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)
+          [[ "$current" == "$SOURCE_COMMIT" ]] || { echo 'source main moved; refusing a stale release'; exit 1; }
+          file=reference/values.yaml
+          gh api "repos/${repository}/contents/${file}?ref=main" > current.json
+          jq -r .content current.json | base64 -d > values.yaml
+          yq -i '.ingest.image = strenv(IMAGE) | .ingest.sourceRevision = strenv(SOURCE_COMMIT)' values.yaml
+          jq -n --arg sha "$(jq -r .sha current.json)" --arg source "$SOURCE_COMMIT" \
+            --arg content "$(base64 -w0 values.yaml)" \
+            '{message:("chore: deploy telemetry-ingest " + $source),branch:"main",sha:$sha,content:$content}' > update.json
+          # The contents API checks the previous blob SHA; concurrent edits fail visibly.
+          gh api --method PUT "repos/${repository}/contents/${file}" --input update.json >/dev/null
