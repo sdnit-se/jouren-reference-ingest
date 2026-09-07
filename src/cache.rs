@@ -43,26 +43,28 @@ impl Cache {
         let mut inner = self.lock();
         for (sensor, reading) in readings {
             let sensor_is_new = !inner.by_sensor.contains_key(sensor);
-            let entry = inner
-                .by_sensor
-                .entry(sensor.clone())
-                .or_insert_with(|| Entry {
-                    readings: VecDeque::with_capacity(self.per_sensor.min(64)),
-                    newest: reading.ts,
-                });
+            let evicted = {
+                let entry = inner
+                    .by_sensor
+                    .entry(sensor.clone())
+                    .or_insert_with(|| Entry {
+                        readings: VecDeque::with_capacity(self.per_sensor.min(64)),
+                        newest: reading.ts,
+                    });
+                let position = entry
+                    .readings
+                    .partition_point(|existing| existing.ts <= reading.ts);
+                entry.readings.insert(position, reading.clone());
+                entry.newest = entry.newest.max(reading.ts);
+                if entry.readings.len() > self.per_sensor {
+                    entry.readings.pop_front()
+                } else {
+                    None
+                }
+            };
             if sensor_is_new {
                 inner.bytes += sensor.byte_len();
             }
-            let position = entry
-                .readings
-                .partition_point(|existing| existing.ts <= reading.ts);
-            entry.readings.insert(position, reading.clone());
-            entry.newest = entry.newest.max(reading.ts);
-            let evicted = if entry.readings.len() > self.per_sensor {
-                entry.readings.pop_front()
-            } else {
-                None
-            };
             inner.bytes -= evicted.as_ref().map_or(0, Reading::byte_len);
             inner.bytes += reading.byte_len();
             inner.readings += usize::from(evicted.is_none());
