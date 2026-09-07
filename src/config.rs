@@ -11,6 +11,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub db: DbConfig,
     pub cache_per_sensor: usize,
+    pub cache_max_sensors: usize,
     pub warm_on_start: bool,
     /// Readings older than this are deleted by the periodic sweep; the
     /// table stays bounded on a small volume.
@@ -44,7 +45,7 @@ pub enum ConfigError {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Ok(Self {
+        let config = Self {
             listen: parsed("INGEST_LISTEN", "socket address", Some("0.0.0.0:8080"))?,
             db: DbConfig {
                 host: required("INGEST_DB_HOST")?,
@@ -60,12 +61,32 @@ impl Config {
                 )?),
             },
             cache_per_sensor: parsed("INGEST_CACHE_PER_SENSOR", "integer", Some("2000"))?,
+            cache_max_sensors: parsed("INGEST_CACHE_MAX_SENSORS", "integer", Some("128"))?,
             warm_on_start: parsed("INGEST_WARM_ON_START", "boolean", Some("true"))?,
             retention_hours: parsed("INGEST_RETENTION_HOURS", "integer", Some("1"))?,
             otlp_endpoint: optional("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
             service_name: optional("OTEL_SERVICE_NAME", "telemetry-ingest"),
-        })
+        };
+        validate_cache_limits(config.cache_per_sensor, config.cache_max_sensors)?;
+        Ok(config)
     }
+}
+
+fn validate_cache_limits(per_sensor: usize, max_sensors: usize) -> Result<(), ConfigError> {
+    if per_sensor == 0
+        || max_sensors == 0
+        || max_sensors > 4096
+        || per_sensor
+            .checked_mul(max_sensors)
+            .is_none_or(|total| total > 262_144)
+    {
+        return Err(ConfigError::Invalid {
+            name: "INGEST_CACHE_PER_SENSOR/INGEST_CACHE_MAX_SENSORS",
+            expected: "positive cache limits with at most 4096 sensors and 262144 total readings",
+            value: format!("{per_sensor}/{max_sensors}"),
+        });
+    }
+    Ok(())
 }
 
 fn required(name: &'static str) -> Result<String, ConfigError> {
@@ -97,4 +118,20 @@ fn parsed<T: std::str::FromStr>(
         expected,
         value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_limits_fit_default_and_deployed_memory_budgets() {
+        assert!(validate_cache_limits(2000, 128).is_ok());
+        assert!(validate_cache_limits(500, 128).is_ok());
+        assert!(validate_cache_limits(64, 4096).is_ok());
+        for (per_sensor, sensors) in [(0, 128), (500, 0), (1, 4097), (2000, 2000)] {
+            assert!(validate_cache_limits(per_sensor, sensors).is_err());
+        }
+        assert!(validate_cache_limits(usize::MAX, 128).is_err());
+    }
 }

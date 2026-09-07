@@ -21,7 +21,10 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let telemetry = Telemetry::init(&config.service_name, &config.otlp_endpoint)?;
 
-    let cache = Arc::new(Cache::new(config.cache_per_sensor));
+    let cache = Arc::new(Cache::new(
+        config.cache_per_sensor,
+        config.cache_max_sensors,
+    ));
     let db = Arc::new(Db::connect(&config.db));
     let metrics = Telemetry::instruments(Arc::clone(&cache), Arc::clone(&db));
 
@@ -74,12 +77,13 @@ async fn retention_sweep(db: &Db, hours: u32) {
 /// service carries on empty; a fatal warm would turn a database outage into a
 /// crash loop.
 async fn warm_up(db: &Db, cache: &Cache, per_sensor: i64) {
-    // Chunked by sensor so the warm-up's peak memory is one chunk, not the
-    // whole cache twice over.
-    const CHUNK: usize = 100;
+    // Target at most 8192 rows per chunk, or one sensor if its limit is larger.
+    // This also leaves headroom when the default per-sensor limit is used.
+    let per_sensor_count = usize::try_from(per_sensor).unwrap_or(usize::MAX).max(1);
+    let chunk_size = (8192 / per_sensor_count).clamp(1, 100);
     let result = async {
         let ids = db.sensor_ids().await?;
-        for chunk in ids.chunks(CHUNK) {
+        for chunk in ids.chunks(chunk_size) {
             let rows = db.latest_for_sensors(chunk, per_sensor).await?;
             cache.insert(rows.iter().map(|(s, r)| (s, r)));
         }
