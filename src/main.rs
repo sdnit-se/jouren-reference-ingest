@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics = Telemetry::instruments(Arc::clone(&cache), Arc::clone(&db));
 
     let warm_cache = Arc::clone(&cache);
-    let per_sensor = i64::try_from(config.cache_per_sensor).unwrap_or(i64::MAX);
+    let per_sensor = cache.per_sensor();
     let warm = config.warm_on_start;
     let retention_hours = config.retention_hours;
     db.spawn_migrations(move |db| async move {
@@ -73,13 +73,14 @@ async fn retention_sweep(db: &Db, hours: u32) {
 /// Fills the cache from the newest rows per sensor. Failure is logged and the
 /// service carries on empty; a fatal warm would turn a database outage into a
 /// crash loop.
-async fn warm_up(db: &Db, cache: &Cache, per_sensor: i64) {
-    // Chunked by sensor so the warm-up's peak memory is one chunk, not the
-    // whole cache twice over.
-    const CHUNK: usize = 100;
+async fn warm_up(db: &Db, cache: &Cache, per_sensor: usize) {
+    // Limit each result to 10,000 rows, or one sensor's effective history
+    // when it is larger. The cache caps that history at 100,000 readings.
+    let chunk_size = (10_000 / per_sensor).clamp(1, 100);
+    let per_sensor = i64::try_from(per_sensor).unwrap_or(i64::MAX);
     let result = async {
         let ids = db.sensor_ids().await?;
-        for chunk in ids.chunks(CHUNK) {
+        for chunk in ids.chunks(chunk_size) {
             let rows = db.latest_for_sensors(chunk, per_sensor).await?;
             cache.insert(rows.iter().map(|(s, r)| (s, r)));
         }
