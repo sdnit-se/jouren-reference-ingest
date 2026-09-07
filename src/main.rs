@@ -21,7 +21,10 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let telemetry = Telemetry::init(&config.service_name, &config.otlp_endpoint)?;
 
-    let cache = Arc::new(Cache::new(config.cache_per_sensor, config.cache_max_sensors));
+    let cache = Arc::new(Cache::new(
+        config.cache_per_sensor,
+        config.cache_max_sensors,
+    ));
     let db = Arc::new(Db::connect(&config.db));
     let metrics = Telemetry::instruments(Arc::clone(&cache), Arc::clone(&db));
 
@@ -87,7 +90,11 @@ async fn warm_up(db: &Db, cache: &Cache, per_sensor: i64) {
     match result {
         Ok(()) => {
             let stats = cache.stats();
-            tracing::info!(sensors = stats.sensors, readings = stats.readings, "cache warmed from database");
+            tracing::info!(
+                sensors = stats.sensors,
+                readings = stats.readings,
+                "cache warmed from database"
+            );
         }
         Err(error) => {
             tracing::error!(error = %error, host = db.host(), "cache warm-up failed; starting empty");
@@ -103,7 +110,9 @@ async fn shutdown_signal() {
     };
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => { signal.recv().await; }
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
             Err(error) => tracing::error!(error = %error, "SIGTERM handler failed"),
         }
     };

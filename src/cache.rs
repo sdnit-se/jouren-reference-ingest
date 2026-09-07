@@ -7,7 +7,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub struct CacheStats { pub sensors: usize, pub readings: usize, pub bytes: usize }
+pub struct CacheStats {
+    pub sensors: usize,
+    pub readings: usize,
+    pub bytes: usize,
+}
 
 pub struct Cache {
     per_sensor: usize,
@@ -25,7 +29,11 @@ struct Inner {
 
 impl Cache {
     pub fn new(per_sensor: usize, max_sensors: usize) -> Self {
-        Self { per_sensor: per_sensor.max(1), max_sensors: max_sensors.max(1), inner: Mutex::new(Inner::default()) }
+        Self {
+            per_sensor: per_sensor.max(1),
+            max_sensors: max_sensors.max(1),
+            inner: Mutex::new(Inner::default()),
+        }
     }
 
     pub fn insert<'a>(&self, readings: impl IntoIterator<Item = (&'a SensorId, &'a Reading)>) {
@@ -33,7 +41,9 @@ impl Cache {
         for (sensor, reading) in readings {
             if !inner.by_sensor.contains_key(sensor) {
                 while inner.by_sensor.len() >= self.max_sensors {
-                    let Some(oldest) = inner.sensor_order.pop_front() else { break };
+                    let Some(oldest) = inner.sensor_order.pop_front() else {
+                        break;
+                    };
                     if let Some(evicted) = inner.by_sensor.remove(&oldest) {
                         inner.bytes -= oldest.byte_len();
                         inner.bytes -= evicted.iter().map(Reading::byte_len).sum::<usize>();
@@ -41,13 +51,22 @@ impl Cache {
                     }
                 }
                 inner.bytes += sensor.byte_len();
-                inner.by_sensor.insert(sensor.clone(), VecDeque::with_capacity(self.per_sensor.min(64)));
+                inner.by_sensor.insert(
+                    sensor.clone(),
+                    VecDeque::with_capacity(self.per_sensor.min(64)),
+                );
                 inner.sensor_order.push_back(sensor.clone());
             }
-            let Some(entry) = inner.by_sensor.get_mut(sensor) else { continue };
+            let Some(entry) = inner.by_sensor.get_mut(sensor) else {
+                continue;
+            };
             let position = entry.partition_point(|existing| existing.ts <= reading.ts);
             entry.insert(position, reading.clone());
-            let evicted = if entry.len() > self.per_sensor { entry.pop_front() } else { None };
+            let evicted = if entry.len() > self.per_sensor {
+                entry.pop_front()
+            } else {
+                None
+            };
             inner.bytes -= evicted.as_ref().map_or(0, Reading::byte_len);
             inner.bytes += reading.byte_len();
             inner.readings += usize::from(evicted.is_none());
@@ -64,11 +83,17 @@ impl Cache {
 
     pub fn stats(&self) -> CacheStats {
         let inner = self.lock();
-        CacheStats { sensors: inner.by_sensor.len(), readings: inner.readings, bytes: inner.bytes }
+        CacheStats {
+            sensors: inner.by_sensor.len(),
+            readings: inner.readings,
+            bytes: inner.bytes,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -76,7 +101,14 @@ impl Cache {
 mod tests {
     use super::*;
     use time::OffsetDateTime;
-    fn reading(n: i32) -> Reading { Reading { ts: OffsetDateTime::from_unix_timestamp(i64::from(n)).unwrap(), value: f64::from(n), unit: None } }
+
+    fn reading(n: i32) -> Reading {
+        Reading {
+            ts: OffsetDateTime::from_unix_timestamp(i64::from(n)).unwrap(),
+            value: f64::from(n),
+            unit: None,
+        }
+    }
 
     #[test]
     fn caps_total_sensor_cardinality_and_evicts_oldest() {
@@ -99,7 +131,10 @@ mod tests {
         let readings: Vec<_> = (1..=5).map(reading).collect();
         cache.insert(readings.iter().map(|r| (&sensor, r)));
         let latest = cache.latest(&sensor, 10).unwrap();
-        assert_eq!(latest.iter().map(|r| r.value).collect::<Vec<_>>(), vec![5.0, 4.0, 3.0]);
+        assert_eq!(
+            latest.iter().map(|r| r.value).collect::<Vec<_>>(),
+            vec![5.0, 4.0, 3.0]
+        );
         assert_eq!(cache.stats().readings, 3);
     }
 
@@ -107,6 +142,9 @@ mod tests {
     fn replacement_does_not_grow_bytes_or_readings() {
         let cache = Cache::new(1, 2);
         let sensor = SensorId::parse("sensor").unwrap();
-        for n in 1..20 { cache.insert([(&sensor, &reading(n))]); assert_eq!(cache.stats().readings, 1); }
+        for n in 1..20 {
+            cache.insert([(&sensor, &reading(n))]);
+            assert_eq!(cache.stats().readings, 1);
+        }
     }
 }
