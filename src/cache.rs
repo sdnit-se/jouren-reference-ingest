@@ -42,17 +42,17 @@ impl Cache {
     pub fn insert<'a>(&self, readings: impl IntoIterator<Item = (&'a SensorId, &'a Reading)>) {
         let mut inner = self.lock();
         for (sensor, reading) in readings {
-            if !inner.by_sensor.contains_key(sensor) {
+            let sensor_is_new = !inner.by_sensor.contains_key(sensor);
+            let entry = inner
+                .by_sensor
+                .entry(sensor.clone())
+                .or_insert_with(|| Entry {
+                    readings: VecDeque::with_capacity(self.per_sensor.min(64)),
+                    newest: reading.ts,
+                });
+            if sensor_is_new {
                 inner.bytes += sensor.byte_len();
-                inner.by_sensor.insert(
-                    sensor.clone(),
-                    Entry {
-                        readings: VecDeque::with_capacity(self.per_sensor.min(64)),
-                        newest: reading.ts,
-                    },
-                );
             }
-            let entry = inner.by_sensor.get_mut(sensor).expect("entry inserted");
             let position = entry
                 .readings
                 .partition_point(|existing| existing.ts <= reading.ts);
@@ -67,13 +67,17 @@ impl Cache {
             inner.bytes += reading.byte_len();
             inner.readings += usize::from(evicted.is_none());
             while inner.by_sensor.len() > self.max_sensors {
-                let victim = inner
+                let Some(victim) = inner
                     .by_sensor
                     .iter()
                     .min_by_key(|(_, entry)| entry.newest)
                     .map(|(sensor, _)| sensor.clone())
-                    .expect("cache is non-empty");
-                let removed = inner.by_sensor.remove(&victim).expect("victim exists");
+                else {
+                    break;
+                };
+                let Some(removed) = inner.by_sensor.remove(&victim) else {
+                    continue;
+                };
                 inner.bytes -= victim.byte_len()
                     + removed
                         .readings
@@ -156,6 +160,7 @@ mod tests {
         let historical: Vec<_> = (1..10).map(reading).collect();
         cache.insert(historical.iter().map(|r| (&old, r)));
         assert!(cache.latest(&live, 1).is_some());
-        assert_eq!(cache.latest(&live, 1).unwrap()[0].value, 100.0);
+        let latest = cache.latest(&live, 1).unwrap();
+        assert!((latest[0].value - 100.0).abs() < f64::EPSILON);
     }
 }

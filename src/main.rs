@@ -92,7 +92,7 @@ async fn warm_up(db: &Db, cache: &Cache, per_sensor: i64) {
             );
         }
         Err(error) => {
-            tracing::error!(error = %error, host = db.host(), "cache warm-up failed; starting empty")
+            tracing::error!(error = %error, host = db.host(), "cache warm-up failed; starting empty");
         }
     }
 }
