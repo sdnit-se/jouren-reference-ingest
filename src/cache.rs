@@ -324,7 +324,8 @@ mod tests {
         for n in 0..130 {
             let sensor = SensorId::parse(&format!("{n:064}")).unwrap();
             for ts in 0..2001 {
-                let mut r = reading(ts);
+                // Admit each new sensor immediately so churn still fills every entry.
+                let mut r = reading(n * 2001 + ts);
                 r.unit = Some("u".repeat(Reading::MAX_UNIT_LEN));
                 cache.insert([(&sensor, &r)]);
             }
