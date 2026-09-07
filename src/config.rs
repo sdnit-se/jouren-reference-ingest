@@ -11,6 +11,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub db: DbConfig,
     pub cache_per_sensor: usize,
+    pub cache_max_sensors: usize,
     pub warm_on_start: bool,
     /// Readings older than this are deleted by the periodic sweep; the
     /// table stays bounded on a small volume.
@@ -60,6 +61,7 @@ impl Config {
                 )?),
             },
             cache_per_sensor: parsed("INGEST_CACHE_PER_SENSOR", "integer", Some("2000"))?,
+            cache_max_sensors: parsed("INGEST_CACHE_MAX_SENSORS", "integer", Some("4096"))?,
             warm_on_start: parsed("INGEST_WARM_ON_START", "boolean", Some("true"))?,
             retention_hours: parsed("INGEST_RETENTION_HOURS", "integer", Some("1"))?,
             otlp_endpoint: optional("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
