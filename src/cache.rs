@@ -1,9 +1,14 @@
 //! In-memory "latest readings" cache serving `GET /readings/latest` without a
-//! round trip to Postgres. Readings are capped per sensor; the newest are kept.
+//! round trip to Postgres. Per-sensor and global bounds retain newer timestamps.
 
 use crate::readings::{Reading, SensorId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+
+// Fixed safety ceilings for the reference's 192 MiB container. Bound both map
+// overhead and reading storage, regardless of the per-sensor configuration.
+const MAX_SENSORS: usize = 4096;
+const MAX_READINGS: usize = 65_536;
 
 /// Size figures exposed on `/stats` and as gauges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -27,25 +32,78 @@ struct Inner {
     bytes: usize,
 }
 
+impl Inner {
+    fn remove_sensor(&mut self, sensor: &SensorId) {
+        if let Some(entry) = self.by_sensor.remove(sensor) {
+            self.readings -= entry.len();
+            self.bytes -= sensor.byte_len() + entry.iter().map(Reading::byte_len).sum::<usize>();
+        }
+    }
+
+    fn trim(&mut self) {
+        while self.by_sensor.len() > MAX_SENSORS {
+            // Historical warm-up must not displace a sensor whose newest
+            // reading is newer. Equal-timestamp victims are unspecified.
+            let oldest = self
+                .by_sensor
+                .iter()
+                .min_by_key(|(_, entry)| entry.back().map(|r| r.ts))
+                .map(|(sensor, _)| sensor.clone());
+            let Some(sensor) = oldest else {
+                break;
+            };
+            self.remove_sensor(&sensor);
+        }
+        while self.readings > MAX_READINGS {
+            // Evict individual oldest readings, not a newer live sensor just
+            // because warm-up added history to another sensor.
+            let oldest = self
+                .by_sensor
+                .iter()
+                .min_by_key(|(_, entry)| entry.front().map(|r| r.ts))
+                .map(|(sensor, _)| sensor.clone());
+            let Some(sensor) = oldest else {
+                break;
+            };
+            let Some(entry) = self.by_sensor.get_mut(&sensor) else {
+                break;
+            };
+            let removed = entry.pop_front();
+            let empty = entry.is_empty();
+            // A count bound alone would leave large historical allocations
+            // behind after draining a deque. Keep spare capacity bounded too.
+            if entry.capacity() > 2 * entry.len().max(4) {
+                entry.shrink_to_fit();
+            }
+            if let Some(reading) = removed {
+                self.readings -= 1;
+                self.bytes -= reading.byte_len();
+            }
+            if empty {
+                self.remove_sensor(&sensor);
+            }
+        }
+    }
+}
+
 impl Cache {
     pub fn new(per_sensor: usize) -> Self {
         Self {
-            per_sensor: per_sensor.max(1),
+            per_sensor: per_sensor.clamp(1, MAX_READINGS),
             inner: Mutex::new(Inner::default()),
         }
     }
 
     /// Merge by timestamp and retain the newest readings, including during warm-up.
     /// Equal timestamps retain arrival order; measurements are not deduplicated.
+    /// Global pressure may shorten histories or evict whole sensors; it never
+    /// changes persisted readings.
     pub fn insert<'a>(&self, readings: impl IntoIterator<Item = (&'a SensorId, &'a Reading)>) {
         let mut inner = self.lock();
         for (sensor, reading) in readings {
             if !inner.by_sensor.contains_key(sensor) {
                 inner.bytes += sensor.byte_len();
-                inner.by_sensor.insert(
-                    sensor.clone(),
-                    VecDeque::with_capacity(self.per_sensor.min(64)),
-                );
+                inner.by_sensor.insert(sensor.clone(), VecDeque::new());
             }
             let Some(entry) = inner.by_sensor.get_mut(sensor) else {
                 continue;
@@ -61,10 +119,11 @@ impl Cache {
             inner.bytes -= evicted.as_ref().map_or(0, Reading::byte_len);
             inner.bytes += reading.byte_len();
             inner.readings += usize::from(evicted.is_none());
+            inner.trim();
         }
     }
 
-    /// Newest-first slice of a sensor's readings, or `None` for an unknown sensor.
+    /// Newest-first slice, or `None` for an unknown or evicted sensor.
     pub fn latest(&self, sensor: &SensorId, limit: usize) -> Option<Vec<Reading>> {
         let inner = self.lock();
         let entry = inner.by_sensor.get(sensor)?;
@@ -206,5 +265,94 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.sensors, 50);
         assert_eq!(stats.readings, 50);
+    }
+
+    fn assert_bounded_and_accounted(cache: &Cache) {
+        let inner = cache.lock();
+        assert!(inner.by_sensor.len() <= MAX_SENSORS);
+        assert!(inner.readings <= MAX_READINGS);
+        assert_eq!(
+            inner.readings,
+            inner.by_sensor.values().map(VecDeque::len).sum::<usize>()
+        );
+        assert_eq!(
+            inner.bytes,
+            inner
+                .by_sensor
+                .iter()
+                .map(|(sensor, entry)| {
+                    sensor.byte_len() + entry.iter().map(Reading::byte_len).sum::<usize>()
+                })
+                .sum::<usize>()
+        );
+        for entry in inner.by_sensor.values() {
+            assert!(!entry.is_empty());
+            assert!(entry.capacity() <= 2 * entry.len().max(4));
+        }
+    }
+
+    #[test]
+    fn fresh_ids_are_bounded_and_evicted_ids_can_return() {
+        let cache = Cache::new(500);
+        for n in 0..5000 {
+            let sensor = SensorId::parse(&format!("s-{n}")).unwrap();
+            cache.insert([(&sensor, &reading(n))]);
+        }
+        assert_bounded_and_accounted(&cache);
+        assert_eq!(cache.stats().sensors, MAX_SENSORS);
+        let first = SensorId::parse("s-0").unwrap();
+        let newest = SensorId::parse("s-4999").unwrap();
+        assert!(cache.latest(&first, 1).is_none());
+        assert_eq!(cache.latest(&newest, 1).unwrap(), vec![reading(4999)]);
+        // Replaying old history must not replace a newer cached sensor.
+        cache.insert([(&first, &reading(0))]);
+        assert!(cache.latest(&first, 1).is_none());
+        cache.insert([(&first, &reading(10_000))]);
+        assert_eq!(cache.latest(&first, 1).unwrap(), vec![reading(10_000)]);
+        assert_bounded_and_accounted(&cache);
+    }
+
+    #[test]
+    fn total_bound_applies_with_the_default_per_sensor_setting() {
+        let cache = Cache::new(2000);
+        for sensor_number in 0..40 {
+            let sensor = SensorId::parse(&format!("s-{sensor_number}")).unwrap();
+            for n in 0..2000 {
+                let mut r = reading(sensor_number * 2000 + n);
+                r.unit = Some("u".repeat(Reading::MAX_UNIT_LEN));
+                cache.insert([(&sensor, &r)]);
+            }
+        }
+        assert_eq!(cache.stats().readings, MAX_READINGS);
+        assert_bounded_and_accounted(&cache);
+    }
+
+    #[test]
+    fn historical_warm_up_concurrent_with_live_writes_respects_global_bound() {
+        use std::sync::Barrier;
+
+        let cache = Cache::new(usize::MAX);
+        let hot = SensorId::parse("hot").unwrap();
+        let other = SensorId::parse("other-live").unwrap();
+        cache.insert([(&hot, &reading(1_000_000)), (&other, &reading(900_000))]);
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for n in 0..70_000 {
+                    cache.insert([(&hot, &reading(n))]);
+                }
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                for n in 1_000_001..1_000_101 {
+                    cache.insert([(&hot, &reading(n))]);
+                }
+            });
+        });
+        assert_eq!(cache.stats().readings, MAX_READINGS);
+        assert_eq!(cache.latest(&hot, 1).unwrap(), vec![reading(1_000_100)]);
+        assert_eq!(cache.latest(&other, 1).unwrap(), vec![reading(900_000)]);
+        assert_bounded_and_accounted(&cache);
     }
 }
