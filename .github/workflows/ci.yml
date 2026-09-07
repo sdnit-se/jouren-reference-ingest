@@ -12,6 +12,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with: {persist-credentials: false}
@@ -32,6 +33,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
+        timeout-minutes: 3
 
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha != vars.REFERENCE_BASELINE_COMMIT
@@ -39,6 +41,7 @@ jobs:
     # Build against glibc 2.35, compatible with the Debian 12 runtime (2.36).
     # A newer runner ABI cannot safely be copied into that runtime image.
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     environment: reference-release
     permissions:
       contents: read
