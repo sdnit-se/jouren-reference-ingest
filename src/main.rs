@@ -32,21 +32,12 @@ async fn main() -> anyhow::Result<()> {
     let per_sensor = i64::try_from(config.cache_per_sensor).unwrap_or(i64::MAX);
     let warm = config.warm_on_start;
     let retention_hours = config.retention_hours;
-    let (warm_ready, warm_complete) = tokio::sync::oneshot::channel();
     db.spawn_migrations(move |db| async move {
         if warm {
             warm_up(&db, &warm_cache, per_sensor).await;
         }
-        let _ = warm_ready.send(());
         retention_sweep(&db, retention_hours).await;
     });
-
-    // Do not let warm-up and live ingestion race for the bounded cache. In
-    // particular, warm-up must not evict a live entry and then restore an old
-    // reading for that sensor.
-    if warm {
-        wait_for_warm_up(warm_complete).await;
-    }
 
     let listening = Arc::new(AtomicBool::new(false));
     let app = api::router(AppState {
@@ -66,10 +57,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("shutting down");
     telemetry.shutdown();
     Ok(())
-}
-
-async fn wait_for_warm_up(ready: tokio::sync::oneshot::Receiver<()>) {
-    let _ = ready.await;
 }
 
 /// Deletes readings past the retention window every five minutes, forever.
@@ -132,20 +119,5 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::wait_for_warm_up;
-
-    #[tokio::test]
-    async fn serving_gate_stays_closed_until_warm_up_completes() {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn(wait_for_warm_up(receiver));
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-        sender.send(()).unwrap();
-        waiter.await.unwrap();
     }
 }

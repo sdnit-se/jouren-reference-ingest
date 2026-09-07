@@ -60,8 +60,10 @@ impl Config {
                     Some("3"),
                 )?),
             },
-            cache_per_sensor: parsed("INGEST_CACHE_PER_SENSOR", "integer", Some("2000"))?,
-            cache_max_sensors: parsed("INGEST_CACHE_MAX_SENSORS", "integer", Some("4096"))?,
+            // 500 readings for each of 512 sensors keeps the default cache
+            // well below the memory budget of the 192 MiB container.
+            cache_per_sensor: parsed("INGEST_CACHE_PER_SENSOR", "integer", Some("500"))?,
+            cache_max_sensors: parsed("INGEST_CACHE_MAX_SENSORS", "integer", Some("512"))?,
             warm_on_start: parsed("INGEST_WARM_ON_START", "boolean", Some("true"))?,
             retention_hours: parsed("INGEST_RETENTION_HOURS", "integer", Some("1"))?,
             otlp_endpoint: optional("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
